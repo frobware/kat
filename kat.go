@@ -30,6 +30,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+var activeStreams sync.Map
+
 func streamPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, since time.Duration) error {
 	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
@@ -67,18 +69,18 @@ func streamPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespa
 	return nil
 }
 
-func startLogStream(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, activeStreams map[string]context.CancelFunc, since time.Duration) {
-	if _, exists := activeStreams[podName]; exists {
+func startLogStream(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, since time.Duration) {
+	if _, exists := activeStreams.Load(podName); exists {
 		return
 	}
 
 	podCtx, cancel := context.WithCancel(ctx)
-	activeStreams[podName] = cancel
+	activeStreams.Store(podName, cancel)
 
 	go func() {
 		defer func() {
 			cancel()
-			delete(activeStreams, podName)
+			activeStreams.Delete(podName)
 		}()
 
 		backoff := wait.Backoff{
@@ -90,9 +92,9 @@ func startLogStream(ctx context.Context, clientset *kubernetes.Clientset, namesp
 
 		err := wait.ExponentialBackoff(backoff, func() (bool, error) {
 			if err := streamPodLogs(podCtx, clientset, namespace, podName, since); err != nil {
-				return false, nil // Retry on error
+				return false, nil
 			}
-			return true, nil // Success
+			return true, nil
 		})
 		if err != nil {
 			log.Printf("Failed to start log streaming for pod %s after retries: %v\n", podName, err)
@@ -100,17 +102,15 @@ func startLogStream(ctx context.Context, clientset *kubernetes.Clientset, namesp
 	}()
 }
 
-func stopLogStream(podName string, activeStreams map[string]context.CancelFunc) {
-	if cancel, exists := activeStreams[podName]; exists {
-		cancel()
-		delete(activeStreams, podName)
+func stopLogStream(podName string) {
+	if cancel, ok := activeStreams.Load(podName); ok {
+		cancel.(context.CancelFunc)()
+		activeStreams.Delete(podName)
 		log.Printf("Stopped log stream for pod: %s\n", podName)
 	}
 }
 
 func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace string, since time.Duration) {
-	activeStreams := make(map[string]context.CancelFunc)
-
 	podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Printf("Error listing pods in namespace %s: %v\n", namespace, err)
@@ -119,7 +119,7 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace s
 
 	for _, pod := range podList.Items {
 		if pod.Status.Phase == corev1.PodRunning {
-			startLogStream(ctx, clientset, namespace, pod.Name, activeStreams, since)
+			startLogStream(ctx, clientset, namespace, pod.Name, since)
 		}
 	}
 
@@ -130,7 +130,7 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace s
 		AddFunc: func(obj interface{}) {
 			pod := obj.(*corev1.Pod)
 			if pod.Status.Phase == corev1.PodRunning {
-				startLogStream(ctx, clientset, namespace, pod.Name, activeStreams, since)
+				startLogStream(ctx, clientset, namespace, pod.Name, since)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -138,14 +138,14 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace s
 			newPod := newObj.(*corev1.Pod)
 
 			if newPod.Status.Phase == corev1.PodRunning && oldPod.Status.Phase != corev1.PodRunning {
-				startLogStream(ctx, clientset, namespace, newPod.Name, activeStreams, since)
+				startLogStream(ctx, clientset, namespace, newPod.Name, since)
 			} else if newPod.Status.Phase != corev1.PodRunning {
-				stopLogStream(newPod.Name, activeStreams)
+				stopLogStream(newPod.Name)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
 			pod := obj.(*corev1.Pod)
-			stopLogStream(pod.Name, activeStreams)
+			stopLogStream(pod.Name)
 		},
 	})
 
