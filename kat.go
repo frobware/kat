@@ -35,7 +35,7 @@ var activeStreams sync.Map
 func streamPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, since time.Duration) error {
 	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("error getting pod %s: %v", podName, err)
+		return fmt.Errorf("error getting pod %s: %w", podName, err)
 	}
 
 	var wg sync.WaitGroup
