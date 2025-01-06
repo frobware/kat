@@ -264,7 +264,7 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 
 				// Lazy creation of directory and file
 				if file == nil && k.outputConfig.TeeDir != "" {
-					filePath = filepath.Join(k.outputConfig.TeeDir, namespace, podName, "%s.log"+containerName)
+					filePath = filepath.Join(k.outputConfig.TeeDir, namespace, podName, containerName+".txt")
 					if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
 						if k.callbacks != nil && k.callbacks.OnError != nil {
 							k.callbacks.OnError(fmt.Errorf("error creating directories for %s: %w", filePath, err))
@@ -289,12 +289,10 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 					}
 				}
 
-				// Trigger OnLogLine callback
 				if k.callbacks != nil && k.callbacks.OnLogLine != nil {
 					k.callbacks.OnLogLine(namespace, podName, containerName, line)
 				}
 
-				// Write to file if configured
 				if file != nil {
 					// TODO - handle write failures.
 					file.WriteString(line + "\n")

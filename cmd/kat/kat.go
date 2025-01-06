@@ -43,7 +43,7 @@ func main() {
 		}
 
 		*teeDir = tempDir
-		log.Printf("Using temporary log directory: %s", tempDir)
+		log.Printf("Log directory: %s", tempDir)
 	} else if *teeDir != "" {
 		if _, err := os.Stat(*teeDir); err == nil && !*allowExisting {
 			log.Fatalf("Directory %s already exists. Use --allow-existing to continue.", *teeDir)
@@ -93,10 +93,10 @@ func main() {
 			log.Printf("Error: %v", err)
 		},
 		OnFileClosed: func(filePath string) {
-			log.Printf("Closed log file: %s", filePath)
+			log.Println("Closed log file", filePath)
 		},
 		OnFileCreated: func(filePath string) {
-			log.Printf("Created log file: %s", filePath)
+			log.Println("Created log file", filePath)
 		},
 		OnLogLine: func(namespace, podName, containerName, line string) {
 			if !*silent {
