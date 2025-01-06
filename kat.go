@@ -180,7 +180,6 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace s
 	}
 
 	<-ctx.Done()
-	log.Println("Stopping pod watcher...")
 }
 
 func stopLogStream(podName string) {
@@ -196,7 +195,7 @@ func main() {
 		progname := filepath.Base(os.Args[0])
 		fmt.Fprintf(os.Stderr, "%s: Stream Kubernetes pod logs across namespaces\n\n", progname)
 		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  %s [flags]\n\n", progname)
+		fmt.Fprintf(os.Stderr, "  %s [flags] [<namespace>...]\n\n", progname)
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 
 		flag.PrintDefaults()
@@ -205,19 +204,33 @@ func main() {
 	qpsPtr := flag.Float64("qps", 500, "Kubernetes client QPS")
 	burstPtr := flag.Int("burst", 1000, "Kubernetes client burst")
 	kubeconfigFlag := flag.String("kubeconfig", "", "Path to the kubeconfig file (defaults to ~/.kube/config)")
-	namespacePtr := flag.String("namespaces", "default", "Comma-separated list of namespaces to watch")
-	flag.StringVar(namespacePtr, "n", "default", "Comma-separated list of namespaces to watch")
 	sincePtr := flag.Duration("since", time.Minute, "Show logs since duration (e.g., 5m)")
 	teeDir := flag.String("tee", "", "Directory to write logs to (optional)")
 	silent := flag.Bool("silent", false, "Disable console output for log lines")
 
 	flag.Parse()
 
-	namespaces := strings.Split(*namespacePtr, ",")
 	kubeconfigPath := *kubeconfigFlag
 	if kubeconfigPath == "" {
 		kubeconfigPath = clientcmd.NewDefaultClientConfigLoadingRules().GetDefaultFilename()
 	}
+
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	configOverrides := &clientcmd.ConfigOverrides{}
+	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+
+	currentNamespace, _, err := clientConfig.Namespace()
+	if err != nil {
+		log.Printf("Error determining current namespace: %v\n", err)
+		return
+	}
+
+	namespaces := flag.Args()
+	if len(namespaces) == 0 {
+		log.Printf("No namespaces specified; defaulting to the current namespace: %s\n", currentNamespace)
+		namespaces = []string{currentNamespace}
+	}
+
 	log.Printf("Using kubeconfig: %s\n", kubeconfigPath)
 
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
@@ -243,12 +256,12 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	for i := range namespaces {
+	for _, namespace := range namespaces {
 		wg.Add(1)
-		go func(i int) {
+		go func(namespace string) {
 			defer wg.Done()
-			watchPods(ctx, clientset, strings.TrimSpace(namespaces[i]), *sincePtr, outputCfg)
-		}(i)
+			watchPods(ctx, clientset, strings.TrimSpace(namespace), *sincePtr, outputCfg)
+		}(namespace)
 	}
 	wg.Wait()
 }

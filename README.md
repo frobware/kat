@@ -10,7 +10,7 @@ go install github.com/frobware/kat@latest
 ## Example
 
 ```bash
-% go run kat.go -n openshift-ingress,openshift-ingress-operator --since=3s | grep -v Proxy
+% go run kat.go --since=3s openshift-ingress openshift-ingress-operator | grep -v Proxy
 2025/01/03 17:57:06 Using kubeconfig: /home/aim/.kube/config
 2025/01/03 17:57:06 Streaming logs for pod: openshift-ingress-operator/idle-close-on-response-rr5xj-external-verify:echo
 2025/01/03 17:57:06 Streaming logs for pod: openshift-ingress-operator/idle-close-on-response-jpgfr-external-verify:echo
