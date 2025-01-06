@@ -1,6 +1,10 @@
 # kat - Kubernetes Attach & Tail
 
-`kat` streams logs from all containers in specified Kubernetes namespaces in real-time.
+`kat` streams logs from all containers in specified Kubernetes
+namespaces in real-time. It dynamically monitors your namespaces,
+automatically attaching to new pods as they are created and streaming
+their logs. When pods terminate, `kat` stops streaming their logs,
+ensuring efficient resource usage.
 
 ## Installation
 
@@ -69,6 +73,6 @@ kat --tee /tmp/logs --silent openshift-ingress
 ```
 
 ### Notes
-- By default, if no namespace is specified, kat streams logs from the current Kubernetes namespace.
+- By default, if no namespace is specified, `kat` streams logs from the current Kubernetes namespace.
 - If `--silent` is used, container logs are not printed to the console, but progress messages (e.g., “Started streaming logs”) are still displayed.
 - Logs are written lazily, meaning directories and files are only created when log entries are received.
