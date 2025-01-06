@@ -32,6 +32,12 @@ func main() {
 		}
 
 		tempDir := "/tmp/kat-" + time.Now().Format(time.RFC3339)
+		if _, err := os.Stat(tempDir); err == nil {
+			log.Fatalf("Temporary directory %s already exists. This is unexpected.", tempDir)
+		} else if !os.IsNotExist(err) {
+			log.Fatalf("Error checking temporary directory %s: %v", tempDir, err)
+		}
+
 		if err := os.MkdirAll(tempDir, 0o755); err != nil {
 			log.Fatalf("Error creating temporary directory %s: %v", tempDir, err)
 		}
