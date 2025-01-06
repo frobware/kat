@@ -32,7 +32,13 @@ import (
 
 var activeStreams sync.Map
 
-func streamPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, since time.Duration) error {
+// outputConfig encapsulates configuration for controlling log output.
+type outputConfig struct {
+	teeDir string // Directory to write logs (optional).
+	silent bool   // Suppress console log output.
+}
+
+func streamPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, since time.Duration, outputCfg *outputConfig) error {
 	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error getting pod %s: %w", podName, err)
@@ -58,9 +64,34 @@ func streamPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespa
 			}
 			defer stream.Close()
 
+			var file *os.File
+			if outputCfg.teeDir != "" {
+				filePath := filepath.Join(outputCfg.teeDir, namespace, podName, fmt.Sprintf("%s.log", containerName))
+				if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+					log.Printf("Error creating directories for %s: %v\n", filePath, err)
+					return
+				}
+				file, err = os.Create(filePath)
+				if err != nil {
+					log.Printf("Error creating file %s: %v\n", filePath, err)
+					return
+				}
+				log.Printf("Created log file: %s\n", filePath)
+				defer func() {
+					file.Close()
+					log.Printf("Closed log file: %s\n", filePath)
+				}()
+			}
+
 			scanner := bufio.NewScanner(stream)
 			for scanner.Scan() {
-				log.Printf("[%s/%s:%s] %s\n", namespace, podName, containerName, scanner.Text())
+				logLine := fmt.Sprintf("[%s/%s:%s] %s\n", namespace, podName, containerName, scanner.Text())
+				if !outputCfg.silent {
+					log.Print(logLine)
+				}
+				if file != nil {
+					file.WriteString(scanner.Text() + "\n")
+				}
 			}
 		}(container.Name)
 	}
@@ -69,7 +100,7 @@ func streamPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespa
 	return nil
 }
 
-func startLogStream(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, since time.Duration) {
+func startLogStream(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, since time.Duration, outputCfg *outputConfig) {
 	if _, exists := activeStreams.Load(podName); exists {
 		return
 	}
@@ -91,7 +122,7 @@ func startLogStream(ctx context.Context, clientset *kubernetes.Clientset, namesp
 		}
 
 		err := wait.ExponentialBackoff(backoff, func() (bool, error) {
-			if err := streamPodLogs(podCtx, clientset, namespace, podName, since); err != nil {
+			if err := streamPodLogs(podCtx, clientset, namespace, podName, since, outputCfg); err != nil {
 				return false, nil
 			}
 			return true, nil
@@ -102,15 +133,7 @@ func startLogStream(ctx context.Context, clientset *kubernetes.Clientset, namesp
 	}()
 }
 
-func stopLogStream(podName string) {
-	if cancel, ok := activeStreams.Load(podName); ok {
-		cancel.(context.CancelFunc)()
-		activeStreams.Delete(podName)
-		log.Printf("Stopped log stream for pod: %s\n", podName)
-	}
-}
-
-func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace string, since time.Duration) {
+func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace string, since time.Duration, outputCfg *outputConfig) {
 	podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Printf("Error listing pods in namespace %s: %v\n", namespace, err)
@@ -119,7 +142,7 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace s
 
 	for _, pod := range podList.Items {
 		if pod.Status.Phase == corev1.PodRunning {
-			startLogStream(ctx, clientset, namespace, pod.Name, since)
+			startLogStream(ctx, clientset, namespace, pod.Name, since, outputCfg)
 		}
 	}
 
@@ -130,7 +153,7 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace s
 		AddFunc: func(obj interface{}) {
 			pod := obj.(*corev1.Pod)
 			if pod.Status.Phase == corev1.PodRunning {
-				startLogStream(ctx, clientset, namespace, pod.Name, since)
+				startLogStream(ctx, clientset, namespace, pod.Name, since, outputCfg)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -138,7 +161,7 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace s
 			newPod := newObj.(*corev1.Pod)
 
 			if newPod.Status.Phase == corev1.PodRunning && oldPod.Status.Phase != corev1.PodRunning {
-				startLogStream(ctx, clientset, namespace, newPod.Name, since)
+				startLogStream(ctx, clientset, namespace, newPod.Name, since, outputCfg)
 			} else if newPod.Status.Phase != corev1.PodRunning {
 				stopLogStream(newPod.Name)
 			}
@@ -160,6 +183,14 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace s
 	log.Println("Stopping pod watcher...")
 }
 
+func stopLogStream(podName string) {
+	if cancel, ok := activeStreams.Load(podName); ok {
+		cancel.(context.CancelFunc)()
+		activeStreams.Delete(podName)
+		log.Printf("Stopped log stream for pod: %s\n", podName)
+	}
+}
+
 func main() {
 	flag.Usage = func() {
 		progname := filepath.Base(os.Args[0])
@@ -170,12 +201,15 @@ func main() {
 
 		flag.PrintDefaults()
 	}
+
 	qpsPtr := flag.Float64("qps", 500, "Kubernetes client QPS")
 	burstPtr := flag.Int("burst", 1000, "Kubernetes client burst")
 	kubeconfigFlag := flag.String("kubeconfig", "", "Path to the kubeconfig file (defaults to ~/.kube/config)")
 	namespacePtr := flag.String("namespaces", "default", "Comma-separated list of namespaces to watch")
 	flag.StringVar(namespacePtr, "n", "default", "Comma-separated list of namespaces to watch")
 	sincePtr := flag.Duration("since", time.Minute, "Show logs since duration (e.g., 5m)")
+	teeDir := flag.String("tee", "", "Directory to write logs to (optional)")
+	silent := flag.Bool("silent", false, "Disable console output for log lines")
 
 	flag.Parse()
 
@@ -203,13 +237,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	outputCfg := &outputConfig{
+		teeDir: *teeDir,
+		silent: *silent,
+	}
+
 	var wg sync.WaitGroup
 	for i := range namespaces {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			watchPods(ctx, clientset, strings.TrimSpace(namespaces[i]), *sincePtr)
-		}()
+			watchPods(ctx, clientset, strings.TrimSpace(namespaces[i]), *sincePtr, outputCfg)
+		}(i)
 	}
 	wg.Wait()
 }
