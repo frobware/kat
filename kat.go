@@ -239,43 +239,50 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 			defer stream.Close()
 
 			var file *os.File
-			if k.outputConfig.TeeDir != "" {
-				filePath := filepath.Join(k.outputConfig.TeeDir, namespace, podName, fmt.Sprintf("%s.log", containerName))
-				if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
-					if k.callbacks != nil && k.callbacks.OnError != nil {
-						k.callbacks.OnError(fmt.Errorf("error creating directories for %s: %w", filePath, err))
-					}
-					return
-				}
-				file, err = os.Create(filePath)
-				if err != nil {
-					if k.callbacks != nil && k.callbacks.OnError != nil {
-						k.callbacks.OnError(fmt.Errorf("error creating file %s: %w", filePath, err))
-					}
-					return
-				}
-				k.openFiles.Store(filePath, file)
-				if k.callbacks != nil && k.callbacks.OnFileCreated != nil {
-					k.callbacks.OnFileCreated(filePath)
-				}
-				defer func() {
-					k.openFiles.Delete(filePath)
-					if k.callbacks != nil && k.callbacks.OnFileClosed != nil {
-						k.callbacks.OnFileClosed(filePath)
-					}
-				}()
-			}
+			var filePath string
 
 			scanner := bufio.NewScanner(stream)
 			for scanner.Scan() {
 				line := scanner.Text()
 
+				// Lazy creation of directory and file
+				if file == nil && k.outputConfig.TeeDir != "" {
+					filePath = filepath.Join(k.outputConfig.TeeDir, namespace, podName, fmt.Sprintf("%s.log", containerName))
+					if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+						if k.callbacks != nil && k.callbacks.OnError != nil {
+							k.callbacks.OnError(fmt.Errorf("error creating directories for %s: %w", filePath, err))
+						}
+						return
+					}
+					file, err = os.Create(filePath)
+					if err != nil {
+						if k.callbacks != nil && k.callbacks.OnError != nil {
+							k.callbacks.OnError(fmt.Errorf("error creating file %s: %w", filePath, err))
+						}
+						return
+					}
+					k.openFiles.Store(filePath, file)
+					if k.callbacks != nil && k.callbacks.OnFileCreated != nil {
+						k.callbacks.OnFileCreated(filePath)
+					}
+				}
+
+				// Trigger OnLogLine callback
 				if k.callbacks != nil && k.callbacks.OnLogLine != nil {
 					k.callbacks.OnLogLine(namespace, podName, containerName, line)
 				}
 
+				// Write to file if configured
 				if file != nil {
 					file.WriteString(line + "\n")
+				}
+			}
+
+			if file != nil {
+				k.openFiles.Delete(filePath)
+				file.Close()
+				if k.callbacks != nil && k.callbacks.OnFileClosed != nil {
+					k.callbacks.OnFileClosed(filePath)
 				}
 			}
 
