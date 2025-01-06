@@ -4,21 +4,15 @@
 // when they terminate. Think of it as cat(1) and tail(1) combined,
 // but for watching all container logs in your selected Kubernetes
 // namespaces simultaneously.
-
-package main
+package kat
 
 import (
 	"bufio"
 	"context"
-	"flag"
 	"fmt"
-	"log"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -27,91 +21,172 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
-var activeStreams sync.Map
-
-// outputConfig encapsulates configuration for controlling log output.
-type outputConfig struct {
-	teeDir string // Directory to write logs (optional).
-	silent bool   // Suppress console log output.
+// Callbacks provides hooks for progress updates.
+type Callbacks struct {
+	OnError       func(err error)
+	OnFileClosed  func(filePath string)
+	OnFileCreated func(filePath string)
+	OnLogLine     func(namespace, podName, containerName, line string)
+	OnStreamStart func(namespace, podName, containerName string)
+	OnStreamStop  func(namespace, podName, containerName string)
 }
 
-func streamPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, since time.Duration, outputCfg *outputConfig) error {
-	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("error getting pod %s: %w", podName, err)
-	}
+// Kat represents the main structure for managing POD log streaming.
+type Kat struct {
+	clientset     *kubernetes.Clientset
+	outputConfig  *OutputConfig
+	activeStreams sync.Map
+	openFiles     sync.Map
+	callbacks     *Callbacks
+}
 
+// OutputConfig encapsulates configuration for controlling log output.
+type OutputConfig struct {
+	TeeDir string // Directory to write logs (optional).
+	Silent bool   // Suppress console log output.
+}
+
+// New creates a new Kat instance.
+func New(clientset *kubernetes.Clientset, outputConfig *OutputConfig, callbacks *Callbacks) *Kat {
+	return &Kat{
+		clientset:    clientset,
+		outputConfig: outputConfig,
+		callbacks:    callbacks,
+	}
+}
+
+// StartStreaming begins streaming logs for the specified namespaces.
+func (k *Kat) StartStreaming(ctx context.Context, namespaces []string, since time.Duration) error {
 	var wg sync.WaitGroup
-	for _, container := range pod.Spec.Containers {
+	errCh := make(chan error, len(namespaces))
+
+	for _, namespace := range namespaces {
 		wg.Add(1)
-		go func(containerName string) {
+		go func(namespace string) {
 			defer wg.Done()
-			log.Printf("Streaming logs for pod: %s/%s:%s\n", namespace, podName, containerName)
-
-			req := clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
-				Container: containerName,
-				Follow:    true,
-				SinceTime: &metav1.Time{Time: time.Now().Add(-since)},
-			})
-
-			stream, err := req.Stream(context.Background())
-			if err != nil {
-				log.Printf("Error streaming logs for pod %s, container %s: %v\n", podName, containerName, err)
-				return
+			if err := k.watchPods(ctx, namespace, since); err != nil {
+				errCh <- fmt.Errorf("namespace %s: %w", namespace, err)
 			}
-			defer stream.Close()
-
-			var file *os.File
-			if outputCfg.teeDir != "" {
-				filePath := filepath.Join(outputCfg.teeDir, namespace, podName, fmt.Sprintf("%s.log", containerName))
-				if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
-					log.Printf("Error creating directories for %s: %v\n", filePath, err)
-					return
-				}
-				file, err = os.Create(filePath)
-				if err != nil {
-					log.Printf("Error creating file %s: %v\n", filePath, err)
-					return
-				}
-				log.Printf("Created log file: %s\n", filePath)
-				defer func() {
-					file.Close()
-					log.Printf("Closed log file: %s\n", filePath)
-				}()
-			}
-
-			scanner := bufio.NewScanner(stream)
-			for scanner.Scan() {
-				logLine := fmt.Sprintf("[%s/%s:%s] %s\n", namespace, podName, containerName, scanner.Text())
-				if !outputCfg.silent {
-					log.Print(logLine)
-				}
-				if file != nil {
-					file.WriteString(scanner.Text() + "\n")
-				}
-			}
-		}(container.Name)
+		}(namespace)
 	}
-	wg.Wait()
 
+	wg.Wait()
+	close(errCh)
+
+	var errs []error
+	for err := range errCh {
+		if k.callbacks != nil && k.callbacks.OnError != nil {
+			k.callbacks.OnError(err)
+		}
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("streaming errors: %v", errs)
+	}
 	return nil
 }
 
-func startLogStream(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, since time.Duration, outputCfg *outputConfig) {
-	if _, exists := activeStreams.Load(podName); exists {
-		return
+// StopStreaming stops all active log streams and closes open files.
+func (k *Kat) StopStreaming() error {
+	var errs []error
+
+	k.activeStreams.Range(func(key, value interface{}) bool {
+		if cancel, ok := value.(context.CancelFunc); ok {
+			cancel()
+		}
+		k.activeStreams.Delete(key)
+		return true
+	})
+
+	k.openFiles.Range(func(key, value interface{}) bool {
+		if file, ok := value.(*os.File); ok {
+			if err := file.Sync(); err != nil {
+				errs = append(errs, fmt.Errorf("sync file %v: %w", key, err))
+			}
+			if err := file.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close file %v: %w", key, err))
+			}
+			if k.callbacks != nil && k.callbacks.OnFileClosed != nil {
+				k.callbacks.OnFileClosed(key.(string))
+			}
+		}
+		k.openFiles.Delete(key)
+		return true
+	})
+
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during cleanup: %v", errs)
+	}
+	return nil
+}
+
+// watchPods monitors pods in the specified namespace and manages log
+// streaming.
+func (k *Kat) watchPods(ctx context.Context, namespace string, since time.Duration) error {
+	podList, err := k.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("error listing pods in namespace %s: %w", namespace, err)
+	}
+
+	for _, pod := range podList.Items {
+		if pod.Status.Phase == corev1.PodRunning {
+			if err := k.startLogStream(ctx, namespace, pod.Name, since); err != nil {
+				return fmt.Errorf("error starting log stream for pod %s: %w", pod.Name, err)
+			}
+		}
+	}
+
+	factory := informers.NewSharedInformerFactoryWithOptions(k.clientset, 0, informers.WithNamespace(namespace))
+	podInformer := factory.Core().V1().Pods().Informer()
+
+	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			pod := obj.(*corev1.Pod)
+			if pod.Status.Phase == corev1.PodRunning {
+				_ = k.startLogStream(ctx, namespace, pod.Name, since)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldPod := oldObj.(*corev1.Pod)
+			newPod := newObj.(*corev1.Pod)
+
+			if newPod.Status.Phase == corev1.PodRunning && oldPod.Status.Phase != corev1.PodRunning {
+				_ = k.startLogStream(ctx, namespace, newPod.Name, since)
+			} else if newPod.Status.Phase != corev1.PodRunning {
+				k.stopLogStream(newPod.Name)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			pod := obj.(*corev1.Pod)
+			k.stopLogStream(pod.Name)
+		},
+	})
+
+	go podInformer.Run(ctx.Done())
+
+	if !cache.WaitForCacheSync(ctx.Done(), podInformer.HasSynced) {
+		return fmt.Errorf("failed to sync informer cache for namespace %s", namespace)
+	}
+
+	<-ctx.Done()
+	return nil
+}
+
+// startLogStream begins streaming logs for a specific pod.
+func (k *Kat) startLogStream(ctx context.Context, namespace, podName string, since time.Duration) error {
+	if _, exists := k.activeStreams.Load(podName); exists {
+		return nil
 	}
 
 	podCtx, cancel := context.WithCancel(ctx)
-	activeStreams.Store(podName, cancel)
+	k.activeStreams.Store(podName, cancel)
 
 	go func() {
 		defer func() {
 			cancel()
-			activeStreams.Delete(podName)
+			k.activeStreams.Delete(podName)
 		}()
 
 		backoff := wait.Backoff{
@@ -121,147 +196,103 @@ func startLogStream(ctx context.Context, clientset *kubernetes.Clientset, namesp
 			Jitter:   0.1,
 		}
 
-		err := wait.ExponentialBackoff(backoff, func() (bool, error) {
-			if err := streamPodLogs(podCtx, clientset, namespace, podName, since, outputCfg); err != nil {
+		_ = wait.ExponentialBackoff(backoff, func() (bool, error) {
+			if err := k.streamPodLogs(podCtx, namespace, podName, since); err != nil {
 				return false, nil
 			}
 			return true, nil
 		})
-		if err != nil {
-			log.Printf("Failed to start log streaming for pod %s after retries: %v\n", podName, err)
-		}
 	}()
+	return nil
 }
 
-func watchPods(ctx context.Context, clientset *kubernetes.Clientset, namespace string, since time.Duration, outputCfg *outputConfig) {
-	podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+// streamPodLogs streams logs from the specified pod and container.
+func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, since time.Duration) error {
+	pod, err := k.clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
-		log.Printf("Error listing pods in namespace %s: %v\n", namespace, err)
-		return
-	}
-
-	for _, pod := range podList.Items {
-		if pod.Status.Phase == corev1.PodRunning {
-			startLogStream(ctx, clientset, namespace, pod.Name, since, outputCfg)
-		}
-	}
-
-	factory := informers.NewSharedInformerFactoryWithOptions(clientset, 0, informers.WithNamespace(namespace))
-	podInformer := factory.Core().V1().Pods().Informer()
-
-	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			pod := obj.(*corev1.Pod)
-			if pod.Status.Phase == corev1.PodRunning {
-				startLogStream(ctx, clientset, namespace, pod.Name, since, outputCfg)
-			}
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldPod := oldObj.(*corev1.Pod)
-			newPod := newObj.(*corev1.Pod)
-
-			if newPod.Status.Phase == corev1.PodRunning && oldPod.Status.Phase != corev1.PodRunning {
-				startLogStream(ctx, clientset, namespace, newPod.Name, since, outputCfg)
-			} else if newPod.Status.Phase != corev1.PodRunning {
-				stopLogStream(newPod.Name)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			pod := obj.(*corev1.Pod)
-			stopLogStream(pod.Name)
-		},
-	})
-
-	go podInformer.Run(ctx.Done())
-
-	if !cache.WaitForCacheSync(ctx.Done(), podInformer.HasSynced) {
-		log.Println("Failed to sync informer cache")
-		return
-	}
-
-	<-ctx.Done()
-}
-
-func stopLogStream(podName string) {
-	if cancel, ok := activeStreams.Load(podName); ok {
-		cancel.(context.CancelFunc)()
-		activeStreams.Delete(podName)
-		log.Printf("Stopped log stream for pod: %s\n", podName)
-	}
-}
-
-func main() {
-	flag.Usage = func() {
-		progname := filepath.Base(os.Args[0])
-		fmt.Fprintf(os.Stderr, "%s: Stream Kubernetes pod logs across namespaces\n\n", progname)
-		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  %s [flags] [<namespace>...]\n\n", progname)
-		fmt.Fprintf(os.Stderr, "Flags:\n")
-
-		flag.PrintDefaults()
-	}
-
-	qpsPtr := flag.Float64("qps", 500, "Kubernetes client QPS")
-	burstPtr := flag.Int("burst", 1000, "Kubernetes client burst")
-	kubeconfigFlag := flag.String("kubeconfig", "", "Path to the kubeconfig file (defaults to ~/.kube/config)")
-	sincePtr := flag.Duration("since", time.Minute, "Show logs since duration (e.g., 5m)")
-	teeDir := flag.String("tee", "", "Directory to write logs to (optional)")
-	silent := flag.Bool("silent", false, "Disable console output for log lines")
-
-	flag.Parse()
-
-	kubeconfigPath := *kubeconfigFlag
-	if kubeconfigPath == "" {
-		kubeconfigPath = clientcmd.NewDefaultClientConfigLoadingRules().GetDefaultFilename()
-	}
-
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	configOverrides := &clientcmd.ConfigOverrides{}
-	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
-
-	currentNamespace, _, err := clientConfig.Namespace()
-	if err != nil {
-		log.Printf("Error determining current namespace: %v\n", err)
-		return
-	}
-
-	namespaces := flag.Args()
-	if len(namespaces) == 0 {
-		log.Printf("No namespaces specified; defaulting to the current namespace: %s\n", currentNamespace)
-		namespaces = []string{currentNamespace}
-	}
-
-	log.Printf("Using kubeconfig: %s\n", kubeconfigPath)
-
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-	if err != nil {
-		log.Printf("Error loading kubeconfig: %v\n", err)
-		return
-	}
-
-	config.QPS = float32(*qpsPtr)
-	config.Burst = *burstPtr
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		log.Printf("Error creating Kubernetes client: %v\n", err)
-		return
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	outputCfg := &outputConfig{
-		teeDir: *teeDir,
-		silent: *silent,
+		return fmt.Errorf("error getting pod %s: %w", podName, err)
 	}
 
 	var wg sync.WaitGroup
-	for _, namespace := range namespaces {
+	for _, container := range pod.Spec.Containers {
 		wg.Add(1)
-		go func(namespace string) {
+		go func(containerName string) {
 			defer wg.Done()
-			watchPods(ctx, clientset, strings.TrimSpace(namespace), *sincePtr, outputCfg)
-		}(namespace)
+
+			if k.callbacks != nil && k.callbacks.OnStreamStart != nil {
+				k.callbacks.OnStreamStart(namespace, podName, containerName)
+			}
+
+			req := k.clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
+				Container: containerName,
+				Follow:    true,
+				SinceTime: &metav1.Time{Time: time.Now().Add(-since)},
+			})
+
+			stream, err := req.Stream(ctx)
+			if err != nil {
+				if k.callbacks != nil && k.callbacks.OnError != nil {
+					k.callbacks.OnError(fmt.Errorf("error streaming logs for pod %s, container %s: %w", podName, containerName, err))
+				}
+				return
+			}
+			defer stream.Close()
+
+			var file *os.File
+			if k.outputConfig.TeeDir != "" {
+				filePath := filepath.Join(k.outputConfig.TeeDir, namespace, podName, fmt.Sprintf("%s.log", containerName))
+				if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+					if k.callbacks != nil && k.callbacks.OnError != nil {
+						k.callbacks.OnError(fmt.Errorf("error creating directories for %s: %w", filePath, err))
+					}
+					return
+				}
+				file, err = os.Create(filePath)
+				if err != nil {
+					if k.callbacks != nil && k.callbacks.OnError != nil {
+						k.callbacks.OnError(fmt.Errorf("error creating file %s: %w", filePath, err))
+					}
+					return
+				}
+				k.openFiles.Store(filePath, file)
+				if k.callbacks != nil && k.callbacks.OnFileCreated != nil {
+					k.callbacks.OnFileCreated(filePath)
+				}
+				defer func() {
+					k.openFiles.Delete(filePath)
+					if k.callbacks != nil && k.callbacks.OnFileClosed != nil {
+						k.callbacks.OnFileClosed(filePath)
+					}
+				}()
+			}
+
+			scanner := bufio.NewScanner(stream)
+			for scanner.Scan() {
+				line := scanner.Text()
+
+				if k.callbacks != nil && k.callbacks.OnLogLine != nil {
+					k.callbacks.OnLogLine(namespace, podName, containerName, line)
+				}
+
+				if file != nil {
+					file.WriteString(line + "\n")
+				}
+			}
+
+			if k.callbacks != nil && k.callbacks.OnStreamStop != nil {
+				k.callbacks.OnStreamStop(namespace, podName, containerName)
+			}
+		}(container.Name)
 	}
 	wg.Wait()
+
+	return nil
+}
+
+// stopLogStream stops the log stream for a specific pod.
+func (k *Kat) stopLogStream(podName string) {
+	if cancel, ok := k.activeStreams.Load(podName); ok {
+		cancel.(context.CancelFunc)()
+		k.activeStreams.Delete(podName)
+	}
 }
