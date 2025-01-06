@@ -5,7 +5,7 @@
 ## Installation
 
 ```sh
-go install github.com/frobware/kat/cmd@latest
+go install github.com/frobware/kat/cmd/kat@latest
 ```
 
 ## Usage
