@@ -1,10 +1,11 @@
 # kat - Kubernetes Attach & Tail
 
-`kat` streams logs from all containers in specified Kubernetes
-namespaces in real-time. It dynamically monitors your namespaces,
-automatically attaching to new pods as they are created and streaming
-their logs. When pods terminate, `kat` stops streaming their logs,
-ensuring efficient resource usage.
+`kat` provides real-time log streaming from Kubernetes containers
+across specified namespaces. It automatically:
+
+- Detects and attaches to new pods
+- Captures logs from all containers
+- Removes terminated pods from monitoring
 
 ## Installation
 
