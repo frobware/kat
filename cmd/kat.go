@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -32,11 +30,12 @@ func main() {
 		if *teeDir != "" {
 			log.Fatalf("Cannot use --tee and -d together. Choose one.")
 		}
-		tempDir := fmt.Sprintf("/tmp/kat-%s", time.Now().Format(time.RFC3339))
-		tempDir = strings.ReplaceAll(tempDir, ":", "")
-		if err := os.MkdirAll(tempDir, 0755); err != nil {
+
+		tempDir := "/tmp/kat-" + time.Now().Format(time.RFC3339)
+		if err := os.MkdirAll(tempDir, 0o755); err != nil {
 			log.Fatalf("Error creating temporary directory %s: %v", tempDir, err)
 		}
+
 		*teeDir = tempDir
 		log.Printf("Using temporary log directory: %s", tempDir)
 	} else if *teeDir != "" {
@@ -74,6 +73,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error determining current namespace: %v", err)
 		}
+
 		namespaces = []string{namespace}
 	}
 
@@ -110,12 +110,13 @@ func main() {
 
 	go func() {
 		<-ctx.Done()
+
 		if err := k.StopStreaming(); err != nil {
 			log.Printf("Error stopping streaming: %v", err)
 		}
 	}()
 
 	if err := k.StartStreaming(ctx, namespaces, *since); err != nil {
-		log.Fatalf("Error during streaming: %v", err)
+		log.Printf("Error during streaming: %v", err)
 	}
 }

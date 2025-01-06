@@ -60,12 +60,15 @@ func New(clientset *kubernetes.Clientset, outputConfig *OutputConfig, callbacks 
 // StartStreaming begins streaming logs for the specified namespaces.
 func (k *Kat) StartStreaming(ctx context.Context, namespaces []string, since time.Duration) error {
 	var wg sync.WaitGroup
+
 	errCh := make(chan error, len(namespaces))
 
 	for _, namespace := range namespaces {
 		wg.Add(1)
+
 		go func(namespace string) {
 			defer wg.Done()
+
 			if err := k.watchPods(ctx, namespace, since); err != nil {
 				errCh <- fmt.Errorf("namespace %s: %w", namespace, err)
 			}
@@ -76,15 +79,19 @@ func (k *Kat) StartStreaming(ctx context.Context, namespaces []string, since tim
 	close(errCh)
 
 	var errs []error
+
 	for err := range errCh {
 		if k.callbacks != nil && k.callbacks.OnError != nil {
 			k.callbacks.OnError(err)
 		}
+
 		errs = append(errs, err)
 	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("streaming errors: %v", errs)
 	}
+
 	return nil
 }
 
@@ -96,7 +103,9 @@ func (k *Kat) StopStreaming() error {
 		if cancel, ok := value.(context.CancelFunc); ok {
 			cancel()
 		}
+
 		k.activeStreams.Delete(key)
+
 		return true
 	})
 
@@ -105,20 +114,25 @@ func (k *Kat) StopStreaming() error {
 			if err := file.Sync(); err != nil {
 				errs = append(errs, fmt.Errorf("sync file %v: %w", key, err))
 			}
+
 			if err := file.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("close file %v: %w", key, err))
 			}
+
 			if k.callbacks != nil && k.callbacks.OnFileClosed != nil {
 				k.callbacks.OnFileClosed(key.(string))
 			}
 		}
+
 		k.openFiles.Delete(key)
+
 		return true
 	})
 
 	if len(errs) > 0 {
 		return fmt.Errorf("errors during cleanup: %v", errs)
 	}
+
 	return nil
 }
 
@@ -132,9 +146,7 @@ func (k *Kat) watchPods(ctx context.Context, namespace string, since time.Durati
 
 	for _, pod := range podList.Items {
 		if pod.Status.Phase == corev1.PodRunning {
-			if err := k.startLogStream(ctx, namespace, pod.Name, since); err != nil {
-				return fmt.Errorf("error starting log stream for pod %s: %w", pod.Name, err)
-			}
+			k.startLogStream(ctx, namespace, pod.Name, since)
 		}
 	}
 
@@ -145,7 +157,7 @@ func (k *Kat) watchPods(ctx context.Context, namespace string, since time.Durati
 		AddFunc: func(obj interface{}) {
 			pod := obj.(*corev1.Pod)
 			if pod.Status.Phase == corev1.PodRunning {
-				_ = k.startLogStream(ctx, namespace, pod.Name, since)
+				k.startLogStream(ctx, namespace, pod.Name, since)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -153,7 +165,7 @@ func (k *Kat) watchPods(ctx context.Context, namespace string, since time.Durati
 			newPod := newObj.(*corev1.Pod)
 
 			if newPod.Status.Phase == corev1.PodRunning && oldPod.Status.Phase != corev1.PodRunning {
-				_ = k.startLogStream(ctx, namespace, newPod.Name, since)
+				k.startLogStream(ctx, namespace, newPod.Name, since)
 			} else if newPod.Status.Phase != corev1.PodRunning {
 				k.stopLogStream(newPod.Name)
 			}
@@ -171,13 +183,14 @@ func (k *Kat) watchPods(ctx context.Context, namespace string, since time.Durati
 	}
 
 	<-ctx.Done()
+
 	return nil
 }
 
 // startLogStream begins streaming logs for a specific pod.
-func (k *Kat) startLogStream(ctx context.Context, namespace, podName string, since time.Duration) error {
+func (k *Kat) startLogStream(ctx context.Context, namespace, podName string, since time.Duration) {
 	if _, exists := k.activeStreams.Load(podName); exists {
-		return nil
+		return
 	}
 
 	podCtx, cancel := context.WithCancel(ctx)
@@ -198,12 +211,12 @@ func (k *Kat) startLogStream(ctx context.Context, namespace, podName string, sin
 
 		_ = wait.ExponentialBackoff(backoff, func() (bool, error) {
 			if err := k.streamPodLogs(podCtx, namespace, podName, since); err != nil {
-				return false, nil
+				return false, err
 			}
+
 			return true, nil
 		})
 	}()
-	return nil
 }
 
 // streamPodLogs streams logs from the specified pod and container.
@@ -216,6 +229,7 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 	var wg sync.WaitGroup
 	for _, container := range pod.Spec.Containers {
 		wg.Add(1)
+
 		go func(containerName string) {
 			defer wg.Done()
 
@@ -234,12 +248,15 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 				if k.callbacks != nil && k.callbacks.OnError != nil {
 					k.callbacks.OnError(fmt.Errorf("error streaming logs for pod %s, container %s: %w", podName, containerName, err))
 				}
+
 				return
 			}
 			defer stream.Close()
 
-			var file *os.File
-			var filePath string
+			var (
+				file     *os.File
+				filePath string
+			)
 
 			scanner := bufio.NewScanner(stream)
 			for scanner.Scan() {
@@ -247,21 +264,26 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 
 				// Lazy creation of directory and file
 				if file == nil && k.outputConfig.TeeDir != "" {
-					filePath = filepath.Join(k.outputConfig.TeeDir, namespace, podName, fmt.Sprintf("%s.log", containerName))
-					if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+					filePath = filepath.Join(k.outputConfig.TeeDir, namespace, podName, "%s.log"+containerName)
+					if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
 						if k.callbacks != nil && k.callbacks.OnError != nil {
 							k.callbacks.OnError(fmt.Errorf("error creating directories for %s: %w", filePath, err))
 						}
+
 						return
 					}
+
 					file, err = os.Create(filePath)
 					if err != nil {
 						if k.callbacks != nil && k.callbacks.OnError != nil {
 							k.callbacks.OnError(fmt.Errorf("error creating file %s: %w", filePath, err))
 						}
+
 						return
 					}
+
 					k.openFiles.Store(filePath, file)
+
 					if k.callbacks != nil && k.callbacks.OnFileCreated != nil {
 						k.callbacks.OnFileCreated(filePath)
 					}
@@ -274,6 +296,7 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 
 				// Write to file if configured
 				if file != nil {
+					// TODO - handle write failures.
 					file.WriteString(line + "\n")
 				}
 			}
@@ -281,6 +304,7 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 			if file != nil {
 				k.openFiles.Delete(filePath)
 				file.Close()
+
 				if k.callbacks != nil && k.callbacks.OnFileClosed != nil {
 					k.callbacks.OnFileClosed(filePath)
 				}
@@ -291,6 +315,7 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 			}
 		}(container.Name)
 	}
+
 	wg.Wait()
 
 	return nil
