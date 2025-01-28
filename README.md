@@ -1,79 +1,121 @@
-# kat - Kubernetes Attach & Tail
+# kat - Real-time Log Streaming for Kubernetes
 
-`kat` provides real-time log streaming from Kubernetes containers
-across specified namespaces. It automatically:
-
-- Detects and attaches to new pods
-- Captures logs from all containers
-- Removes terminated pods from monitoring
-
-## Installation
+`kat` (Kubernetes Attach & Tail Pod Logs) lets you stream logs from all containers across any number of namespaces in real-time. Think of it as `tail -f` for your entire Kubernetes cluster.
 
 ```sh
-go install github.com/frobware/kat/cmd/kat@latest
+# Stream logs from your frontend namespace
+kat frontend
+
+# Stream from multiple namespaces and save to disk
+kat --tee /tmp/logs frontend backend monitoring
 ```
 
-## Usage
+## Why kat?
 
+Managing logs across a Kubernetes cluster is challenging:
+- `kubectl logs` requires separate commands for each pod
+- You have to manually reattach when pods restart
+- New pods are easily missed
+- Multiple terminal windows needed for multiple namespaces
+
+`kat` solves these problems by:
+- Automatically discovering and attaching to all pods
+- Handling pod restarts and new pod creation
+- Streaming logs from all containers simultaneously
+- Supporting multiple namespaces in a single command
+- Saving logs to disk with automatic directory organization
+
+## Quick Start
+
+1. Install:
+   ```sh
+   go install github.com/frobware/kat/cmd/kat@latest
+   ```
+
+2. Run:
+   ```sh
+   # Stream all logs from current namespace
+   kat
+   
+   # Stream from specific namespaces
+   kat frontend backend
+   
+   # Stream and save logs to disk
+   kat -d frontend  # Creates timestamped directory in /tmp
+   ```
+
+## Basic Usage
+
+### Stream logs to console
 ```sh
-% go run cmd/kat.go --help
-  -allow-existing
-        Allow logging to an existing directory (default: false)
-  -burst int
-        Kubernetes client burst (default 1000)
-  -d
-        Automatically create a temporary directory for logs
-  -kubeconfig string
-        Path to kubeconfig
-  -qps float
-        Kubernetes client QPS (default 500)
-  -silent
-        Disable console output for log lines
-  -since duration
-        Show logs since duration (e.g., 5m) (default 1m0s)
-  -tee string
-        Directory to write logs to (optional)
+# Single namespace
+kat frontend
+
+# Multiple namespaces
+kat frontend backend monitoring
 ```
 
-### Flags
-- `-allow-existing`: Allow kat to log to an existing directory without aborting. Use this flag with -tee to continue logging into an existing directory.
-- `-burst`: The maximum burst size for the Kubernetes client rate limiter. Increase this for higher throughput.
-- `-d`: Automatically create a temporary directory for logs in the format /tmp/kat-<timestamp>.
-- `-kubeconfig`: Path to the Kubernetes kubeconfig file. Defaults to ~/.kube/config if not specified.
-- `-qps`: Queries per second (QPS) for the Kubernetes client. Increase this value for higher throughput.
-- `-silent`: Suppress console output for log lines. Progress messages (e.g., log file creation) will still be displayed.
-- `-since`: Show logs from the specified duration (e.g., 5m for logs from the last 5 minutes). Defaults to 1m.
-- `-tee`: Write logs to the specified directory. If combined with -allow-existing, logs will be appended to an existing directory.
-
-## Examples
-
-Stream logs to the console for multiple namespaces:
+### Save logs to disk
 ```sh
-$ kat openshift-ingress openshift-ingress-operator
+# Auto-create timestamped directory
+kat -d frontend
+→ Using temporary log directory: /tmp/kat-2025-01-06T15:30:00
+
+# Specify output directory
+kat --tee /tmp/my-logs frontend
+
+# Save logs but hide console output
+kat --tee /tmp/logs --silent frontend
 ```
 
-Stream logs and write to a specific directory:
-```sh
-$ kat --tee /tmp/logs openshift-ingress openshift-ingress-operator
+## Directory Structure
+
+When saving logs (using `-d` or `--tee`), `kat` creates this structure:
+```
+/output-dir/
+  └── namespace/
+      └── pod-name/
+          └── container-name.txt
 ```
 
-Stream logs and automatically create a temporary directory:
-```sh
-kat -d openshift-ingress
-Output: Using temporary log directory: /tmp/kat-2025-01-06T15:30:00
+## Common Options
+
+Flag | Description | Default
+---|---|---
+`--since duration` | Show logs from last N minutes | 1m
+`-d` | Auto-create temp directory in /tmp | -
+`--tee string` | Write logs to specified directory | -
+`--silent` | Disable console output | false
+`--allow-existing` | Allow writing to existing directory | false
+
+## Advanced Configuration
+
+For high-throughput clusters or specific requirements:
+
+Flag | Description | Default
+---|---|---
+`--qps float` | Kubernetes client QPS | 500
+`--burst int` | Kubernetes client burst rate | 1000
+`--kubeconfig string` | Path to kubeconfig | ~/.kube/config
+
+## How It Works
+
+```
+┌──────────┐    ┌───────────┐    ┌──────────┐
+│  Pod 1   │    │           │    │ Console  │
+│ Container├────┤           ├────┤          │
+│ Logs     │    │    kat    │    │          │
+├──────────┤    │           │    ├──────────┤
+│  Pod 2   │    │ Automatic │    │          │
+│ Container├────┤ Discovery ├────┤  Files   │
+│ Logs     │    │    &      │    │          │
+├──────────┤    │ Streaming │    │          │
+│   ...    │    │           │    │          │
+└──────────┘    └───────────┘    └──────────┘
 ```
 
-Stream logs to an existing directory:
-```sh
-kat --tee /tmp/logs --allow-existing openshift-ingress
-```
+`kat` uses Kubernetes informers to watch for pod lifecycle events, automatically attaching to new pods and detaching from terminated ones. All container logs are streamed in real-time and can be displayed on the console and/or saved to disk.
 
-Suppress console output and write logs to a directory:
-```sh
-kat --tee /tmp/logs --silent openshift-ingress
-```
+## License
 
-### Notes
-- By default, if no namespace is specified, `kat` streams logs from the current Kubernetes namespace.
-- If `--silent` is used, container logs are not printed to the console, but progress messages (e.g., “Started streaming logs”) are still displayed.
-- Logs are written lazily, meaning directories and files are only created when log entries are received.
+MIT License - see [LICENSE](LICENSE) for details.
