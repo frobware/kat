@@ -111,7 +111,7 @@ func main() {
 		},
 		OnLogLine: func(namespace, podName, containerName, line string) {
 			if !*silent {
-				log.Printf("[%s/%s:%s] %s", namespace, podName, containerName, line)
+				fmt.Printf("[%s/%s:%s] %s\n", namespace, podName, containerName, line)
 			}
 		},
 		OnStreamStart: func(namespace, podName, containerName string) {
