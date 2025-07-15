@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -23,8 +24,18 @@ func main() {
 	teeDir := flag.String("tee", "", "Directory to write logs to (optional)")
 	useTempDir := flag.Bool("d", false, "Automatically create a temporary directory for logs")
 	allowExisting := flag.Bool("allow-existing", false, "Allow logging to an existing directory (default: false)")
+	showVersion := flag.Bool("version", false, "Show version information")
 
 	flag.Parse()
+
+	if *showVersion {
+		info := getVersionInfo()
+		fmt.Printf("kat version %s\n", info.Version)
+		fmt.Printf("Commit time: %s\n", info.CommitTime)
+		fmt.Printf("Go version: %s\n", info.GoVersion)
+		fmt.Printf("Platform: %s\n", info.Platform)
+		return
+	}
 
 	if *useTempDir {
 		if *teeDir != "" {
