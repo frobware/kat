@@ -1,29 +1,35 @@
 # kat - Real-time Log Streaming for Kubernetes
 
-`kat` (Kubernetes Attach & Tail Pod Logs) lets you stream logs from all containers across any number of namespaces in real-time. Think of it as `tail -f` for your entire Kubernetes cluster.
+`kat` (Kubernetes Attach & Tail Pod Logs) streams logs from all containers across namespaces in real-time. It supports glob patterns for namespace matching and automatically discovers new pods.
 
 ```sh
 # Stream logs from your frontend namespace
 kat frontend
 
-# Stream from multiple namespaces and save to disk
-kat --tee /tmp/logs frontend backend monitoring
+# Stream from multiple namespaces with patterns
+kat frontend backend go-*
+
+# Stream from all namespaces (requires cluster-wide permissions)
+kat -A
+
+# Exclude development namespaces
+kat -A --exclude "*-dev"
 ```
 
-## Why kat?
+## Namespace Patterns
 
-Managing logs across a Kubernetes cluster is challenging:
-- `kubectl logs` requires separate commands for each pod
-- You have to manually reattach when pods restart
-- New pods are easily missed
-- Multiple terminal windows needed for multiple namespaces
+`kat` supports glob patterns for namespace matching:
 
-`kat` solves these problems by:
-- Automatically discovering and attaching to all pods
-- Handling pod restarts and new pod creation
-- Streaming logs from all containers simultaneously
-- Supporting multiple namespaces in a single command
-- Saving logs to disk with automatic directory organization
+- `*` matches any sequence of characters
+- `?` matches any single character
+- `[abc]` matches any character in the set
+
+Examples:
+- `kat go-*` matches `go-service`, `go-backend`
+- `kat test-?` matches `test-1`, `test-a` but not `test-10`
+- `kat app-[123]` matches `app-1`, `app-2`, `app-3`
+
+The `--exclude` flag uses the same patterns and can be repeated or comma-separated.
 
 ## Quick Start
 
@@ -36,10 +42,13 @@ Managing logs across a Kubernetes cluster is challenging:
    ```sh
    # Stream all logs from current namespace
    kat
-   
+
    # Stream from specific namespaces
    kat frontend backend
-   
+
+   # Stream with patterns
+   kat go-* frontend-*
+
    # Stream and save logs to disk
    kat -d frontend  # Creates timestamped directory in /tmp
    ```
@@ -52,7 +61,16 @@ Managing logs across a Kubernetes cluster is challenging:
 kat frontend
 
 # Multiple namespaces
-kat frontend backend monitoring
+kat frontend backend
+
+# Glob patterns
+kat go-* frontend-*
+
+# All namespaces
+kat -A
+
+# Exclude patterns
+kat -A --exclude "*-dev" --exclude "kube-*"
 ```
 
 ### Save logs to disk
@@ -82,8 +100,10 @@ When saving logs (using `-d` or `--tee`), `kat` creates this structure:
 
 Flag | Description | Default
 ---|---|---
+`-A` | Watch all namespaces | false
+`--exclude` | Exclude namespace patterns (repeatable) | -
 `--since duration` | Show logs from last N minutes | 1m
-`-d` | Auto-create temp directory in /tmp | -
+`-d` | Auto-create temporary directory in /tmp | -
 `--tee string` | Write logs to specified directory | -
 `--silent` | Disable console output | false
 `--allow-existing` | Allow writing to existing directory | false
@@ -114,7 +134,7 @@ Flag | Description | Default
 └──────────┘    └───────────┘    └──────────┘
 ```
 
-`kat` uses Kubernetes informers to watch for pod lifecycle events, automatically attaching to new pods and detaching from terminated ones. All container logs are streamed in real-time and can be displayed on the console and/or saved to disk.
+`kat` uses Kubernetes informers to watch for pod lifecycle events, automatically attaching to new pods and detaching from terminated ones. When using glob patterns or the `-A` flag, it watches for namespace changes and starts streaming from matching namespaces as they appear.
 
 ## License
 

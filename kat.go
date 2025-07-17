@@ -99,7 +99,7 @@ func (k *Kat) StartStreaming(ctx context.Context, namespaces []string, since tim
 func (k *Kat) StopStreaming() error {
 	var errs []error
 
-	k.activeStreams.Range(func(key, value interface{}) bool {
+	k.activeStreams.Range(func(key, value any) bool {
 		if cancel, ok := value.(context.CancelFunc); ok {
 			cancel()
 		}
@@ -109,7 +109,7 @@ func (k *Kat) StopStreaming() error {
 		return true
 	})
 
-	k.openFiles.Range(func(key, value interface{}) bool {
+	k.openFiles.Range(func(key, value any) bool {
 		if file, ok := value.(*os.File); ok {
 			if err := file.Sync(); err != nil {
 				errs = append(errs, fmt.Errorf("sync file %v: %w", key, err))
@@ -136,8 +136,6 @@ func (k *Kat) StopStreaming() error {
 	return nil
 }
 
-// watchPods monitors pods in the specified namespace and manages log
-// streaming.
 func (k *Kat) watchPods(ctx context.Context, namespace string, since time.Duration) error {
 	podList, err := k.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -154,13 +152,13 @@ func (k *Kat) watchPods(ctx context.Context, namespace string, since time.Durati
 	podInformer := factory.Core().V1().Pods().Informer()
 
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+		AddFunc: func(obj any) {
 			pod := obj.(*corev1.Pod)
 			if pod.Status.Phase == corev1.PodRunning {
 				k.startLogStream(ctx, namespace, pod.Name, since)
 			}
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			oldPod := oldObj.(*corev1.Pod)
 			newPod := newObj.(*corev1.Pod)
 
@@ -170,7 +168,7 @@ func (k *Kat) watchPods(ctx context.Context, namespace string, since time.Durati
 				k.stopLogStream(newPod.Name)
 			}
 		},
-		DeleteFunc: func(obj interface{}) {
+		DeleteFunc: func(obj any) {
 			pod := obj.(*corev1.Pod)
 			k.stopLogStream(pod.Name)
 		},
@@ -187,7 +185,6 @@ func (k *Kat) watchPods(ctx context.Context, namespace string, since time.Durati
 	return nil
 }
 
-// startLogStream begins streaming logs for a specific pod.
 func (k *Kat) startLogStream(ctx context.Context, namespace, podName string, since time.Duration) {
 	if _, exists := k.activeStreams.Load(podName); exists {
 		return
@@ -219,7 +216,6 @@ func (k *Kat) startLogStream(ctx context.Context, namespace, podName string, sin
 	}()
 }
 
-// streamPodLogs streams logs from the specified pod and container.
 func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, since time.Duration) error {
 	pod, err := k.clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
@@ -262,7 +258,6 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 			for scanner.Scan() {
 				line := scanner.Text()
 
-				// Lazy creation of directory and file
 				if file == nil && k.outputConfig.TeeDir != "" {
 					filePath = filepath.Join(k.outputConfig.TeeDir, namespace, podName, containerName+".txt")
 					if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
@@ -294,7 +289,7 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 				}
 
 				if file != nil {
-					// TODO - handle write failures.
+					// TODO: handle write failures.
 					file.WriteString(line + "\n")
 				}
 			}
@@ -319,7 +314,6 @@ func (k *Kat) streamPodLogs(ctx context.Context, namespace, podName string, sinc
 	return nil
 }
 
-// stopLogStream stops the log stream for a specific pod.
 func (k *Kat) stopLogStream(podName string) {
 	if cancel, ok := k.activeStreams.Load(podName); ok {
 		cancel.(context.CancelFunc)()
